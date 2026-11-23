@@ -1,0 +1,3 @@
+#!/bin/bash
+# Blocks commits that contain secrets. Enable with: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/check-secrets.sh" --staged

@@ -1,0 +1,232 @@
+{
+  "name": "Job Tracker – Weekly Digest",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "00cf0fb1-a30d-4e3a-bed5-2e6ee402b568",
+      "name": "Every Monday 9:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "47dfeb2a-87cb-4f35-a0d4-fa1c7dad4eca",
+              "name": "notionDatabaseId",
+              "value": "YOUR_NOTION_DATABASE_ID",
+              "type": "string"
+            },
+            {
+              "id": "606383fb-2744-45eb-bccd-7c00b22fcbd3",
+              "name": "discordWebhookUrl",
+              "value": "YOUR_DISCORD_WEBHOOK_URL",
+              "type": "string"
+            },
+            {
+              "id": "af857f61-2088-44fe-a711-2e9090863a0f",
+              "name": "noResponseAfterDays",
+              "value": 21,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cc50e44b-1d28-411e-99c7-b82e034c81cb",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.notion.com/v1/databases/{{ $('Config').first().json.notionDatabaseId }}/query",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"page_size\": 100,\n  \"sorts\": [\n    {\n      \"timestamp\": \"last_edited_time\",\n      \"direction\": \"descending\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "a348475a-8a8f-47ff-b6aa-ff77db4765e1",
+      "name": "Get all applications (Notion)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Applications still at 'Applied' with no reply after N days → mark No Response.\nconst days = Number($('Config').first().json.noResponseAfterDays) || 21;\nconst cutoff = Date.now() - days * 86400000;\nconst out = [];\nfor (const pg of ($input.first().json.results || [])) {\n  const p = pg.properties || {};\n  const status = p['Status']?.select?.name || '';\n  const applied = p['Applied Date']?.date?.start;\n  const lastReply = p['Last Reply Date']?.date?.start;\n  if (status === 'Applied' && applied && !lastReply && new Date(applied).getTime() < cutoff) {\n    out.push({ json: { pageId: pg.id } });\n  }\n}\nreturn out;\n"
+      },
+      "id": "062fcdaa-1afd-4767-b75a-87b1db16b045",
+      "name": "Find stale applications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.notion.com/v1/pages/{{ $json.pageId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"properties\": {\"Status\": {\"select\": {\"name\": \"No Response\"}}}}",
+        "options": {}
+      },
+      "id": "73822435-17a5-4543-b9fe-4dece3a3a9dd",
+      "name": "Mark No Response",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Weekly pipeline summary for Discord.\nconst cfg = $('Config').first().json;\nconst days = Number(cfg.noResponseAfterDays) || 21;\nconst cutoff = Date.now() - days * 86400000;\nconst weekAgo = Date.now() - 7 * 86400000;\nconst txt = p => !p ? '' : (p.title || p.rich_text || []).map(t => t.plain_text).join('').trim();\n\nconst counts = {};\nconst active = [];\nconst review = [];\nlet newThisWeek = 0;\nlet ghosted = 0;\nfor (const pg of ($input.first().json.results || [])) {\n  const p = pg.properties || {};\n  let status = p['Status']?.select?.name || 'Applied';\n  const applied = p['Applied Date']?.date?.start;\n  const lastReply = p['Last Reply Date']?.date?.start;\n  if (status === 'Applied' && applied && !lastReply && new Date(applied).getTime() < cutoff) { status = 'No Response'; ghosted++; }\n  counts[status] = (counts[status] || 0) + 1;\n  if (applied && new Date(applied).getTime() >= weekAgo) newThisWeek++;\n  const label = `**${txt(p['Company']) || '?'}** – ${txt(p['Role']) || 'role?'}`;\n  if (['Interview', 'Assessment', 'Offer'].includes(status)) {\n    const na = txt(p['Next Action']);\n    active.push(`• ${status}: ${label}${na ? ` → ${na}` : ''} ([open](${pg.url}))`);\n  }\n  if (p['Needs Review']?.checkbox) review.push(`• ${label} ([open](${pg.url}))`);\n}\n\nconst order = ['Applied', 'Under Review', 'Assessment', 'Interview', 'Offer', 'Rejected', 'No Response'];\nconst countLine = order.filter(s => counts[s]).map(s => `${s}: **${counts[s]}**`).join(' · ') || 'No applications yet';\nconst fields = [\n  { name: 'Pipeline', value: countLine },\n  { name: 'Applied this week', value: String(newThisWeek), inline: true },\n  { name: `Marked no response (>${days}d)`, value: String(ghosted), inline: true },\n];\nif (active.length) fields.push({ name: 'In progress', value: active.join('\\n').slice(0, 1000) });\nif (review.length) fields.push({ name: 'Needs review in Notion', value: review.join('\\n').slice(0, 1000) });\n\nreturn [{ json: { discordBody: { embeds: [{ title: '📊 Weekly job search summary', color: 3447003, fields, timestamp: new Date().toISOString() }] } } }];\n"
+      },
+      "id": "ab3b699c-e033-4c31-9e49-975b6d887c86",
+      "name": "Build weekly summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        680,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.discordWebhookUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.discordBody) }}",
+        "options": {}
+      },
+      "id": "e5999915-1968-4e2e-8000-3a89fc4581b6",
+      "name": "Send to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        900,
+        420
+      ]
+    }
+  ],
+  "connections": {
+    "Every Monday 9:00": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get all applications (Notion)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get all applications (Notion)": {
+      "main": [
+        [
+          {
+            "node": "Find stale applications",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build weekly summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find stale applications": {
+      "main": [
+        [
+          {
+            "node": "Mark No Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build weekly summary": {
+      "main": [
+        [
+          {
+            "node": "Send to Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

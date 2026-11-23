@@ -1,0 +1,17 @@
+# Secrets and personal config: never commit these
+.env
+.env.*
+*.local.json
+credentials*.json
+client_secret*.json
+*service-account*.json
+
+# Live exports from n8n can contain webhook URLs and credential IDs
+n8n-export*.json
+*-export.json
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+node_modules/

@@ -1,0 +1,573 @@
+{
+  "name": "Job Application Tracker",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Job Application Tracker\n1. Fill in **Config** (Notion database ID + Discord webhook URL)\n2. Pick credentials: Gmail (2 nodes), Notion (2 HTTP nodes + query), Ollama\n3. In **Mark email processed** pick the `jt-processed` label\n4. Set your model name in **Local LLM (Ollama)**\n\nFull guide: docs/SETUP.md in the GitHub repo.",
+        "height": 260,
+        "width": 420
+      },
+      "id": "c60e6101-a97c-4d0a-9bc3-782da7b9bd83",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "320e1978-215a-46be-89a7-e22702f4f7af",
+      "name": "Every 15 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c30b8eef-7026-431d-8dbf-7bd6f866c19a",
+              "name": "notionDatabaseId",
+              "value": "YOUR_NOTION_DATABASE_ID",
+              "type": "string"
+            },
+            {
+              "id": "b6627ec2-0433-4524-be09-245ad15c8994",
+              "name": "discordWebhookUrl",
+              "value": "YOUR_DISCORD_WEBHOOK_URL",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c3128af4-6e1b-4b9b-b2aa-da79f1c8c0c5",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 100,
+        "simple": false,
+        "filters": {
+          "q": "newer_than:2d -label:jt-processed -from:me -category:promotions -category:social"
+        },
+        "options": {}
+      },
+      "id": "e0503e30-3163-4f49-b0d5-e1c45bb76f05",
+      "name": "Get recent emails",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keeps only emails that look like they are about a job application,\n// and cleans them up so the LLM gets short, plain text.\n\n// Emails from these applicant-tracking systems always pass.\nconst ATS_DOMAINS = [\n  'greenhouse.io','greenhouse-mail.io','lever.co','myworkdayjobs.com','myworkday.com','workday.com',\n  'ashbyhq.com','smartrecruiters.com','icims.com','taleo.net','oraclecloud.com','successfactors.com',\n  'successfactors.eu','workable.com','jobvite.com','bamboohr.com','recruitee.com','teamtailor.com',\n  'teamtailor-mail.com','personio.de','personio.com','breezy.hr','jazzhr.com','applytojob.com',\n  'rippling.com','dover.com','pinpointhq.com','comeet.co','hirehive.com','zohorecruit.com',\n];\n// Job boards send lots of noise, so these only pass when the text also has job keywords.\nconst BOARD_DOMAINS = ['linkedin.com','indeed.com','indeedemail.com','glassdoor.com','ziprecruiter.com','wellfound.com','otta.com','monster.com'];\n\nconst KEYWORDS = /(your application|application (received|submitted|status|update|for)|thank(s| you) for (applying|your (interest|application))|applied (for|to)|we('ve| have) received your|candidacy|candidate|interview|assessment|coding (challenge|test)|take[- ]home|hiring (team|manager)|recruit(er|ing|ment)|talent acquisition|next steps|unfortunately|move forward|moving forward|other candidates|job offer|offer letter|shortlisted|phone screen)/i;\nconst NOISE = /(job alert|jobs? (for|matching) you|new jobs|recommended (jobs|for you)|is hiring|are hiring|people (viewed|are looking)|viewed your profile|weekly digest|newsletter|webinar|invitation to connect|endorsed you|your network)/i;\n\nfunction baseDomain(addr) {\n  const d = (addr.split('@')[1] || '').toLowerCase().trim();\n  const parts = d.split('.');\n  if (parts.length > 2 && ['co','com','org','net','ac','gov','edu'].includes(parts[parts.length - 2])) {\n    return parts.slice(-3).join('.');\n  }\n  return parts.slice(-2).join('.');\n}\n\nfunction stripHtml(html) {\n  return String(html || '')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<br\\s*\\/?>/gi, '\\n')\n    .replace(/<\\/(p|div|tr|li|h\\d)>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')\n    .replace(/&#39;|&rsquo;/g, \"'\").replace(/&quot;/g, '\"');\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const m = item.json;\n  const fromObj = (m.from && m.from.value && m.from.value[0]) || {};\n  const fromAddress = (fromObj.address || m.From || '').toLowerCase();\n  const fromName = fromObj.name || '';\n  const subject = m.subject || m.Subject || '';\n  const fromDomain = baseDomain(fromAddress);\n\n  let body = m.text || stripHtml(m.html || m.textAsHtml || m.snippet || '');\n  body = body\n    .replace(/https?:\\/\\/\\S+/g, '[link]')\n    .replace(/[{}]/g, '')          // braces confuse the LLM prompt template\n    .replace(/[ \\t]+/g, ' ')\n    .replace(/\\n\\s*\\n+/g, '\\n')\n    .trim()\n    .slice(0, 3500);\n\n  const haystack = subject + '\\n' + body.slice(0, 1500);\n  const isAts = ATS_DOMAINS.some(d => fromAddress.endsWith(d));\n  const isBoard = BOARD_DOMAINS.some(d => fromAddress.endsWith(d));\n  const hasKeywords = KEYWORDS.test(haystack);\n  const isNoise = NOISE.test(subject);\n\n  const keep = !isNoise && (isAts || hasKeywords);\n  if (!keep) continue;\n  if (isBoard && !hasKeywords) continue;\n\n  out.push({\n    json: {\n      messageId: m.id,\n      threadId: m.threadId,\n      fromAddress,\n      fromName,\n      fromDomain,\n      viaAts: isAts,\n      viaBoard: isBoard,\n      subject: subject.replace(/[{}]/g, ''),\n      date: m.date ? new Date(m.date).toISOString() : new Date().toISOString(),\n      body,\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "64b93be7-bcce-4064-b3c8-29e543a1b87a",
+      "name": "Pre-filter job emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "77c04290-64e1-4b12-bbe6-956ac516acd0",
+      "name": "Loop Over Emails",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.notion.com/v1/databases/{{ $('Config').first().json.notionDatabaseId }}/query",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"page_size\": 100,\n  \"filter\": {\n    \"and\": [\n      {\n        \"property\": \"Status\",\n        \"select\": {\n          \"does_not_equal\": \"Rejected\"\n        }\n      },\n      {\n        \"property\": \"Status\",\n        \"select\": {\n          \"does_not_equal\": \"No Response\"\n        }\n      }\n    ]\n  },\n  \"sorts\": [\n    {\n      \"timestamp\": \"last_edited_time\",\n      \"direction\": \"descending\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "b00bf254-5e08-449e-ab2f-055b08baf18a",
+      "name": "Get open applications (Notion)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds the list of known applications from Notion, tries a cheap exact\n// match first, then writes the prompt for the LLM.\nconst email = $('Loop Over Emails').first().json;\nconst results = $input.first().json.results || [];\n\nconst txt = p => !p ? '' : (p.title || p.rich_text || []).map(t => t.plain_text).join('').trim();\nconst clean = s => String(s || '').replace(/[{}]/g, '').replace(/\\s+/g, ' ').trim();\n\nconst candidates = results.map(pg => {\n  const p = pg.properties || {};\n  return {\n    id: pg.id,\n    url: pg.url,\n    company: txt(p['Company']),\n    role: txt(p['Role']),\n    domain: txt(p['Company Domain']).toLowerCase().replace(/^www\\./, ''),\n    threadIds: txt(p['Thread IDs']).split(/[\\s,]+/).filter(Boolean),\n    status: (p['Status'] && p['Status'].select && p['Status'].select.name) || 'Applied',\n    lastReplySummary: txt(p['Last Reply Summary']),\n  };\n});\n\n// 1) Same Gmail thread as a known application = certain match.\nlet detIndex = candidates.findIndex(c => c.threadIds.includes(email.threadId));\nlet detReason = detIndex >= 0 ? 'thread' : '';\n// 2) Sender's domain equals the company's domain (not for ATS / job-board senders).\nif (detIndex < 0 && !email.viaAts && !email.viaBoard && email.fromDomain) {\n  const hits = candidates\n    .map((c, i) => ({ c, i }))\n    .filter(x => x.c.domain && (x.c.domain === email.fromDomain || x.c.domain.endsWith('.' + email.fromDomain) || email.fromDomain.endsWith('.' + x.c.domain)));\n  if (hits.length === 1) { detIndex = hits[0].i; detReason = 'domain'; }\n}\n\nconst shown = candidates.slice(0, 60);\nconst list = shown.length\n  ? shown.map((c, i) => `${i + 1}. ${clean(c.company)} | ${clean(c.role) || 'role unknown'} | ${c.domain || 'no domain'} | status: ${c.status}`).join('\\n')\n  : '(none yet)';\n\nconst prompt = `You triage a job seeker's inbox. Read the EMAIL and classify it.\n\nEMAIL TYPES (pick exactly one):\n- application_confirmation: automatic \"we received your application\" or \"thank you for applying\"\n- rejection: the company is not moving forward with the candidate\n- interview_invite: invitation to schedule or attend an interview, phone screen or call\n- assessment: coding test, take-home task, online assessment or questionnaire to complete\n- offer: a job offer\n- info_request: the company asks for documents, availability, references or answers\n- status_update: any other update on an application (still reviewing, application viewed, position on hold)\n- recruiter_outreach: a recruiter reaching out about a NEW role the candidate did not apply to\n- other: not about a specific job application (job alerts, newsletters, marketing, social notifications)\n\nKNOWN APPLICATIONS (numbered):\n${list}\n\nReturn ONLY a JSON object with exactly these keys:\n\"email_type\": one of the types above\n\"company\": the hiring company (the employer, NOT the job board or ATS such as LinkedIn, Indeed, Greenhouse, Workday, Lever), or \"\"\n\"role\": the job title, or \"\"\n\"matched_application\": the number of the KNOWN APPLICATION this email is about, or null if none clearly matches\n\"summary\": one or two short sentences saying what the email says\n\"next_action\": what the candidate should do next, or \"\"\n\"deadline\": any date or time given for the next step, as written in the email, or \"\"\n\nEMAIL\nFrom: ${clean(email.fromName)} <${email.fromAddress}>\nSubject: ${clean(email.subject)}\nDate: ${email.date}\nBody:\n${email.body}`;\n\nreturn [{ json: { prompt, candidates, detIndex, detReason, shownCount: shown.length } }];\n"
+      },
+      "id": "d2c0fedc-1808-47ba-bf2f-65450f5b1641",
+      "name": "Prepare LLM Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}"
+      },
+      "id": "4878464d-f3f4-44f3-b226-e237bdb462b3",
+      "name": "Classify email (LLM)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        1540,
+        380
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": "qwen2.5:7b",
+        "options": {
+          "temperature": 0,
+          "format": "json"
+        }
+      },
+      "id": "545d160a-7bd9-4e6e-b03a-e3bcb50d045a",
+      "name": "Local LLM (Ollama)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parses the LLM answer, picks the matching application, applies the\n// status rules and builds the Notion request + routing for the Switch.\nconst email = $('Loop Over Emails').first().json;\nconst prep = $('Prepare LLM Input').first().json;\nconst cfg = $('Config').first().json;\n\n// ---- parse LLM output (handles \"thinking\" models that write notes before the JSON)\nlet raw = $json.text ?? $json.output ?? $json.response ?? '';\nlet r = null;\nif (raw && typeof raw === 'object') r = raw;\nelse {\n  const str = String(raw).replace(/<think>[\\s\\S]*?<\\/think>/gi, '');\n  const found = [];\n  for (let i = 0; i < str.length; i++) {\n    if (str[i] !== '{') continue;\n    let depth = 0, inStr = false, esc = false;\n    for (let j = i; j < str.length; j++) {\n      const ch = str[j];\n      if (inStr) {\n        if (esc) esc = false;\n        else if (ch === '\\\\') esc = true;\n        else if (ch === '\"') inStr = false;\n        continue;\n      }\n      if (ch === '\"') inStr = true;\n      else if (ch === '{') depth++;\n      else if (ch === '}') { depth--; if (depth === 0) { found.push(str.slice(i, j + 1)); break; } }\n    }\n  }\n  for (const c of found.reverse()) {\n    try { const o = JSON.parse(c); if (o && o.email_type) { r = o; break; } } catch (e) {}\n  }\n}\nif (!r || $json.error || !r.email_type) {\n  // Route 4 = don't label, retry next run (emails drop out of the 2-day window on their own).\n  return [{ json: { route: 4, action: 'retry', messageId: email.messageId, reason: $json.error || 'LLM output not parseable', raw: String(raw).slice(0, 500) } }];\n}\n\nconst TYPES = ['application_confirmation','rejection','interview_invite','assessment','offer','info_request','status_update','recruiter_outreach','other'];\nconst type = TYPES.includes(r.email_type) ? r.email_type : 'other';\nconst s = v => (v === null || v === undefined) ? '' : String(v).trim();\nconst company = s(r.company);\nconst role = s(r.role);\nconst summary = s(r.summary);\nconst nextAction = s(r.next_action);\nconst deadline = s(r.deadline);\n\n// ---- find the matching application\nconst cands = prep.candidates || [];\nlet match = null, matchedBy = '';\nif (prep.detIndex >= 0) { match = cands[prep.detIndex]; matchedBy = prep.detReason; }\nif (!match) {\n  const n = parseInt(r.matched_application, 10);\n  if (n >= 1 && n <= prep.shownCount) { match = cands[n - 1]; matchedBy = 'llm'; }\n}\nif (!match && company) {\n  const norm = x => s(x).toLowerCase().replace(/\\b(inc|ltd|llc|gmbh|plc|corp|corporation|co|limited|group|technologies|technology|labs)\\b/g, '').replace(/[^a-z0-9]/g, '');\n  const c = norm(company);\n  if (c.length >= 3) {\n    const hits = cands.filter(x => { const k = norm(x.company); return k && (k === c || (k.length >= 4 && (k.includes(c) || c.includes(k)))); });\n    if (hits.length === 1) { match = hits[0]; matchedBy = 'name'; }\n  }\n}\n\n// ---- status rules\nconst TYPE_STATUS = {\n  application_confirmation: 'Applied', status_update: 'Under Review', info_request: 'Under Review',\n  assessment: 'Assessment', interview_invite: 'Interview', offer: 'Offer', rejection: 'Rejected',\n};\nconst RANK = { 'No Response': 0, 'Applied': 1, 'Under Review': 2, 'Assessment': 3, 'Interview': 4, 'Offer': 5, 'Rejected': 5 };\nconst mapped = TYPE_STATUS[type];\nlet status = mapped;\nif (match && mapped) {\n  const cur = match.status || 'Applied';\n  const terminal = mapped === 'Rejected' || mapped === 'Offer';\n  status = (terminal || (RANK[mapped] ?? 0) > (RANK[cur] ?? 0)) ? mapped : cur;\n}\n\n// ---- helpers for Notion properties\nconst rt = v => ({ rich_text: v ? [{ text: { content: s(v).slice(0, 1900) } }] : [] });\nconst day = email.date.slice(0, 10);\nconst goodDomain = (!email.viaAts && !email.viaBoard && email.fromDomain && !/^(gmail|googlemail|outlook|hotmail|yahoo|icloud|proton|protonmail)\\./.test(email.fromDomain)) ? email.fromDomain : '';\nconst source = /linkedin/.test(email.fromAddress) ? 'LinkedIn' : /indeed/.test(email.fromAddress) ? 'Indeed' : (email.viaBoard ? 'Other' : 'Company Site');\nconst isReply = ['rejection','interview_invite','assessment','offer','info_request','status_update'].includes(type);\nconst replyText = [summary, deadline ? `Deadline: ${deadline}` : ''].filter(Boolean).join(' ');\n\nlet route = 3, action = 'skip', notify = false, pageId = null, pageUrl = match ? match.url : '', notionBody = null;\n\nif (type === 'other') {\n  route = 3; action = 'skip';\n} else if (type === 'recruiter_outreach') {\n  route = 2; action = 'notify'; notify = true;\n} else if (match) {\n  // update existing row\n  const props = { 'Status': { select: { name: status } } };\n  const threads = match.threadIds.includes(email.threadId) ? match.threadIds : [...match.threadIds, email.threadId];\n  props['Thread IDs'] = rt(threads.join(', '));\n  if (!match.role && role) props['Role'] = rt(role);\n  if (!match.domain && goodDomain) props['Company Domain'] = rt(goodDomain);\n  if (isReply) {\n    props['Last Reply Date'] = { date: { start: day } };\n    props['Last Reply Summary'] = rt(replyText);\n    props['Next Action'] = rt(nextAction);\n  }\n  notionBody = { properties: props };\n  pageId = match.id;\n  route = 1; action = 'update';\n  notify = isReply; // a second confirmation email for a known job is not worth a ping\n} else if (type === 'application_confirmation' || isReply) {\n  // create new row\n  const props = {\n    'Company': { title: [{ text: { content: (company || email.fromName || email.fromDomain || 'Unknown company').slice(0, 200) } }] },\n    'Role': rt(role),\n    'Status': { select: { name: mapped } },\n    'Source': { select: { name: source } },\n    'Thread IDs': rt(email.threadId),\n    'Needs Review': { checkbox: isReply }, // a reply for a job we never logged: double-check it\n  };\n  if (goodDomain) props['Company Domain'] = rt(goodDomain);\n  if (type === 'application_confirmation') props['Applied Date'] = { date: { start: day } };\n  if (isReply) {\n    props['Last Reply Date'] = { date: { start: day } };\n    props['Last Reply Summary'] = rt(replyText);\n    props['Next Action'] = rt(nextAction);\n  }\n  notionBody = { parent: { database_id: cfg.notionDatabaseId }, properties: props };\n  route = 0; action = 'create'; notify = true;\n}\n\nreturn [{ json: {\n  route, action, notify, type, status: status || '', company: company || (match && match.company) || '',\n  role: role || (match && match.role) || '', summary, nextAction, deadline, matchedBy,\n  pageId, pageUrl, notionBody,\n  messageId: email.messageId, threadId: email.threadId, subject: email.subject, fromAddress: email.fromAddress,\n} }];\n"
+      },
+      "id": "2ccb0456-7850-4726-ad9b-685ecf4d5713",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 5,
+        "output": "={{ $json.route }}",
+        "options": {}
+      },
+      "id": "4075ae42-0a40-4435-92aa-8b4b51d9ba9c",
+      "name": "Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1980,
+        360
+      ],
+      "notes": "0 = create Notion row, 1 = update Notion row, 2 = notify only (recruiter outreach), 3 = skip (not job related), 4 = LLM failed: retry next run"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.notion.com/v1/pages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.notionBody) }}",
+        "options": {}
+      },
+      "id": "197fce22-d8b9-41d6-b630-8ca1f56aa7fb",
+      "name": "Create Notion row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2220,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.notion.com/v1/pages/{{ $json.pageId }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "notionApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Notion-Version",
+              "value": "2022-06-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.notionBody) }}",
+        "options": {}
+      },
+      "id": "7e95bd9f-694a-43aa-a637-c93bbf450594",
+      "name": "Update Notion row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2220,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "expression",
+        "numberOutputs": 2,
+        "output": "={{ $('Decide').first().json.notify ? 0 : 1 }}",
+        "options": {}
+      },
+      "id": "e757a7dc-c878-4d4c-b401-c0b316908044",
+      "name": "Should notify?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2440,
+        200
+      ],
+      "notes": "0 = send Discord message, 1 = no message"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Formats the Discord message.\nconst d = $('Decide').first().json;\nconst pageUrl = $json.url || d.pageUrl || '';\nconst gmailUrl = `https://mail.google.com/mail/u/0/#all/${d.threadId}`;\n\nconst STYLE = {\n  application_confirmation: { emoji: '📝', label: 'Application logged', color: 3447003 },\n  rejection:        { emoji: '❌', label: 'Rejection',          color: 15158332 },\n  interview_invite: { emoji: '🎉', label: 'Interview invite',   color: 3066993 },\n  assessment:       { emoji: '🧩', label: 'Assessment',         color: 15105570 },\n  offer:            { emoji: '🏆', label: 'OFFER',              color: 15844367 },\n  info_request:     { emoji: '📨', label: 'Info requested',     color: 3447003 },\n  status_update:    { emoji: '🔄', label: 'Status update',      color: 9807270 },\n  recruiter_outreach: { emoji: '👋', label: 'Recruiter outreach', color: 10181046 },\n};\nconst st = STYLE[d.type] || { emoji: '📬', label: 'Update', color: 9807270 };\nconst links = [`[Open email](${gmailUrl})`, pageUrl ? `[Notion](${pageUrl})` : ''].filter(Boolean).join(' · ');\n\nlet body;\nif (d.type === 'application_confirmation') {\n  body = { content: `${st.emoji} Logged new application: **${d.role || 'role unknown'}** at **${d.company || 'unknown company'}** · ${links}` };\n} else {\n  const fields = [\n    { name: 'Role', value: d.role, inline: true },\n    { name: 'Status', value: d.status, inline: true },\n    { name: 'Next action', value: d.nextAction, inline: false },\n    { name: 'Deadline', value: d.deadline, inline: true },\n    { name: 'Links', value: links, inline: false },\n  ].filter(f => f.value).map(f => ({ ...f, value: String(f.value).slice(0, 1000) }));\n  body = {\n    embeds: [{\n      title: `${st.emoji} ${st.label}: ${d.company || 'Unknown company'}`.slice(0, 250),\n      description: (d.summary || '').slice(0, 2000),\n      color: st.color,\n      fields,\n      footer: { text: `${d.fromAddress} · ${d.subject}`.slice(0, 2000) },\n      timestamp: new Date().toISOString(),\n    }],\n  };\n}\nreturn [{ json: { discordBody: body } }];\n"
+      },
+      "id": "14afda6e-220a-4473-afe0-5f1f26e89474",
+      "name": "Build Discord message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.discordWebhookUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.discordBody) }}",
+        "options": {}
+      },
+      "id": "71ed0bb3-139b-40aa-b072-2e3d45f54803",
+      "name": "Send to Discord",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "addLabels",
+        "messageId": "={{ $('Decide').first().json.messageId }}",
+        "labelIds": []
+      },
+      "id": "50da3d2c-f85a-4732-9dae-f034c46f34f9",
+      "name": "Mark email processed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        3100,
+        380
+      ],
+      "notes": "Pick your 'jt-processed' label in 'Label Names or IDs'"
+    }
+  ],
+  "connections": {
+    "Every 15 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get recent emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get recent emails": {
+      "main": [
+        [
+          {
+            "node": "Pre-filter job emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-filter job emails": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Emails": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Get open applications (Notion)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get open applications (Notion)": {
+      "main": [
+        [
+          {
+            "node": "Prepare LLM Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare LLM Input": {
+      "main": [
+        [
+          {
+            "node": "Classify email (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Local LLM (Ollama)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Classify email (LLM)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify email (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Create Notion row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Notion row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Discord message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark email processed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Notion row": {
+      "main": [
+        [
+          {
+            "node": "Should notify?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Notion row": {
+      "main": [
+        [
+          {
+            "node": "Should notify?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should notify?": {
+      "main": [
+        [
+          {
+            "node": "Build Discord message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark email processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Discord message": {
+      "main": [
+        [
+          {
+            "node": "Send to Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send to Discord": {
+      "main": [
+        [
+          {
+            "node": "Mark email processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark email processed": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
